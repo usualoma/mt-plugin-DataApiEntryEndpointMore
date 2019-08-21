@@ -1,0 +1,78 @@
+id: DataApiEntryEndpointMore
+name: DataApiEntryEndpointMore
+version: 0.0.1
+
+applications:
+    data_api:
+        endpoints:
+            - id: bulk_delete_entries
+              route: /sites/:site_id/entries/bulk-delete
+              verb: DELETE
+              version: 4
+              handler: |
+                sub {
+                    require MT::DataAPI::Endpoint::Common;
+
+                    my ( $app ) = @_;
+                    my %recipe = ();
+                
+                    my ( $blog ) = MT::DataAPI::Endpoint::Common::context_objects(@_)
+                        or return;
+
+                    my @ids = grep { $_ =~ m/\A[0-9]+\z/ && $_ } split ',', $app->param('ids');
+                    my $iter = MT->model('entry')->load_iter({
+                      blog_id => $blog->id,
+                      id => \@ids,
+                    });
+                    my $count = 0;
+                    while (my $entry = $iter->()) {
+                        MT::DataAPI::Endpoint::Common::run_permission_filter( $app, 'data_api_delete_permission_filter',
+                            'entry', $entry )
+                            or next;
+                    
+                        if ( $entry->status eq MT::Entry::RELEASE() ) {
+                            my %r = $app->publisher->rebuild_deleted_entry(
+                                Entry => $entry,
+                                Blog  => $blog
+                            );
+
+                            for my $k1 (keys %r) {
+                                for my $k2 (keys %{$r{$k1}}) {
+                                    for my $k3 (keys %{$r{$k2}}) {
+                                        $recipe{$k1}{$k2}{$k3} = $r{$k1}{$k2}{$k3};
+                                    }
+                                }
+                            }
+                        }
+                    
+                        $entry->remove
+                            or return $app->error(
+                            $app->translate(
+                                'Removing [_1] failed: [_2]', $entry->class_label,
+                                $entry->errstr
+                            ),
+                            500
+                            );
+                    
+                        $app->run_callbacks( 'data_api_post_delete.entry', $app, $entry );
+
+                        $count++;
+                    }
+                
+                    if ( $app->config('RebuildAtDelete') ) {
+                        $app->run_callbacks('pre_build');
+                        MT::Util::start_background_task(
+                            sub {
+                                $app->rebuild_archives(
+                                    Blog   => $blog,
+                                    Recipe => \%recipe,
+                                ) or return $app->publish_error();
+                                $app->rebuild_indexes( Blog => $blog )
+                                    or return $app->publish_error();
+                                $app->run_callbacks( 'rebuild', $blog );
+                            }
+                        );
+                    }
+                
+                    +{ count => $count };
+                }
